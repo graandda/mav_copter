@@ -11,6 +11,9 @@ from pymavlink import mavutil
 # Connect to Mission Planner SITL
 vehicle = connect("127.0.0.1:14551", wait_ready=True)
 
+point_from = [50.450739, 30.461242]
+point_to = [50.443326, 30.448078]  # [ 50.443326, 30.448078 ]  #
+
 point_a = LocationGlobal(50.450739, 30.461242, 0.0)  # altitude to 0 (sea level)
 point_b = LocationGlobalRelative(50.443326, 30.448078, 100)
 target_yaw = 350
@@ -49,23 +52,197 @@ def naw_waypoint(point) -> None:
     :param point: LocationGlobalRelative object
     :return None:
     """
-    msg = vehicle.message_factory.command_long_encode(
-        0,
-        0,
-        mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-        0,
-        0,
-        0,
-        0,
-        0,
-        point.lat,
-        point.lon,
-        point.alt,
+
+    vehicle.mode = VehicleMode("ALT_HOLD")
+    fly_program()
+
+
+SLOW_DISTANCE = 50
+
+
+def get_axis(desired_radiant, current_radiant):
+    delta = desired_radiant - current_radiant
+    if delta > math.pi:
+        delta = delta - math.pi
+    if abs(delta) < 0.1:
+        return 0
+    else:
+        print(delta)
+        rotation_speed = delta / math.pi * 100
+        if abs(rotation_speed) < 50:
+            rotation_speed = -50 if rotation_speed < 0 else 50
+        return rotation_speed
+
+
+def get_pitch_axis(current_dist):
+    if current_dist < SLOW_DISTANCE:
+        return 100
+    else:
+        return 500
+
+
+def calculate_bearing(point_a, point_b):
+    # Convert latitude and longitude to radians
+    lat1, lon1 = math.radians(point_a[0]), math.radians(point_a[1])
+    lat2, lon2 = math.radians(point_b[0]), math.radians(point_b[1])
+
+    # Calculate differences in longitude
+    delta_lon = lon2 - lon1
+
+    # Calculate bearing in radians
+    bearing_radians = math.atan2(
+        math.sin(delta_lon) * math.cos(lat2),
+        math.cos(lat1) * math.sin(lat2)
+        - math.sin(lat1) * math.cos(lat2) * math.cos(delta_lon),
     )
-    # send command to vehicle
-    print("flyng to destanation...")
-    vehicle.send_mavlink(msg)
-    vehicle.flush()
+
+    return bearing_radians
+
+
+def make_rotation_to_point(new_desired_radiant_yaw):
+    current_radiant_yaw = vehicle.attitude.yaw
+    rotation_speed = get_axis(new_desired_radiant_yaw, current_radiant_yaw)
+    if rotation_speed != 0:
+        vehicle.channels.overrides = {
+            "1": int(1500),  # roll
+            "2": int(1500),  # pitch
+            "3": int(1500),  # throttle
+            "4": int(1500 + rotation_speed),  # yaw
+        }
+        time.sleep(0.1)
+
+
+def reset_rotation_to_point():
+    current_point = [
+        vehicle.location.global_frame.lat,
+        vehicle.location.global_frame.lon,
+    ]
+
+    desired_radiant_yaw = calculate_bearing(current_point, point_to)
+    current_radiant_yaw = vehicle.attitude.yaw
+
+    max_iterations = 100
+    tolerance = 10.0  # Set your tolerance value here
+    iterations = 0
+    while (
+        abs(math.degrees(desired_radiant_yaw) - math.degrees(current_radiant_yaw))
+        > tolerance
+        and iterations < max_iterations
+    ):
+        current_radiant_yaw = vehicle.attitude.yaw
+        rotation_speed = get_axis(desired_radiant_yaw, current_radiant_yaw)
+        vehicle.channels.overrides = {
+            "1": int(1500),  # roll
+            "2": int(1500),  # pitch
+            "3": int(1500),  # throttle
+            "4": int(1500 + rotation_speed),  # yaw
+        }
+        time.sleep(0.1)
+        iterations += 1
+
+
+def reset_rotation_to_point_precise():
+    current_point = [
+        vehicle.location.global_frame.lat,
+        vehicle.location.global_frame.lon,
+    ]
+
+    desired_radiant_yaw = calculate_bearing(current_point, point_to)
+    current_radiant_yaw = vehicle.attitude.yaw
+
+    max_iterations = 1000
+    tolerance = 1.0  # Set your tolerance value here
+    iterations = 0
+    while (
+        abs(math.degrees(desired_radiant_yaw) - math.degrees(current_radiant_yaw))
+        > tolerance
+        and iterations < max_iterations
+    ):
+        current_radiant_yaw = vehicle.attitude.yaw
+        rotation_speed = get_axis(desired_radiant_yaw, current_radiant_yaw)
+        vehicle.channels.overrides = {
+            "1": int(1500),  # roll
+            "2": int(1500),  # pitch
+            "3": int(1500),  # throttle
+            "4": int(1500 + rotation_speed),  # yaw
+        }
+        time.sleep(0.1)
+        iterations += 1
+
+
+def fly_program():
+    reset_rotation_to_point()
+
+    distance_to_point = get_distance_metres(vehicle.location.global_frame, point_b)
+
+    dist_tolerance = 1
+
+    while distance_to_point >= 0 + dist_tolerance:
+
+        distance_to_point = get_distance_metres(vehicle.location.global_frame, point_b)
+        current_point = [
+            vehicle.location.global_frame.lat,
+            vehicle.location.global_frame.lon,
+        ]
+
+        new_desired_radiant_yaw = calculate_bearing(current_point, point_to)
+        current_radiant_yaw = vehicle.attitude.yaw
+
+        distance_to_point = get_distance_metres(vehicle.location.global_frame, point_b)
+        vehicle.channels.overrides = {
+            "1": int(1500),  # roll
+            "2": int(1500 - get_pitch_axis(distance_to_point)),  # pitch
+            "3": int(1500),  # throttle
+            "4": int(1500),  # yaw
+        }
+        print(f"Distance to waypoint : {distance_to_point}")
+        time.sleep(0.1)
+
+        tolerance = 1.0  # Set your tolerance value here
+        if (
+            abs(
+                math.degrees(new_desired_radiant_yaw)
+                - math.degrees(current_radiant_yaw)
+            )
+            > tolerance
+        ):  # optimal tolerance
+            make_rotation_to_point(new_desired_radiant_yaw)
+
+        distance_to_point = get_distance_metres(vehicle.location.global_frame, point_b)
+
+        if distance_to_point < 15:
+            while int(vehicle.groundspeed) != 0:
+                vehicle.channels.overrides = {
+                    "1": int(1500),  # roll
+                    "2": int(1500 + get_pitch_axis(distance_to_point)),  # pitch
+                    "3": int(1500),  # throttle
+                    "4": int(1500),  # yaw
+                }
+            break
+
+    vehicle.channels.overrides = {}
+
+    print(f"Distance to waypoint after reset : {distance_to_point}")
+    time.sleep(1)
+    reset_rotation_to_point_precise()
+    time.sleep(1)
+
+    distance_to_point = get_distance_metres(vehicle.location.global_frame, point_b)
+    while distance_to_point > 0 + dist_tolerance:
+        vehicle.channels.overrides = {
+            "1": int(1500),  # roll
+            "2": int(1500 - get_pitch_axis(distance_to_point)),  # pitch
+            "3": int(1500),  # throttle
+            "4": int(1500),  # yaw
+        }
+        distance_to_point = get_distance_metres(vehicle.location.global_frame, point_b)
+        print(f"Distance to waypoint percise : {distance_to_point}")
+        time.sleep(0.1)
+
+    time.sleep(1)
+
+    # Reset all channel overrides
+    vehicle.channels.overrides = {}
 
 
 def get_distance_metres(aLocation1, aLocation2) -> int:
@@ -122,18 +299,10 @@ def arm_and_takeoff(aTargetAltitude) -> None:
 
 print("Starting mission")
 
-arm_and_takeoff(10)
+arm_and_takeoff(100)
+time.sleep(2)
 
-
-vehicle.mode = VehicleMode("AUTO")
 naw_waypoint(point_b)
-while True:
-    distance_to_point = get_distance_metres(vehicle.location.global_frame, point_b)
-    print(f"Distance to waypoint : {distance_to_point}")
-    if distance_to_point == 0:
-        print("Reached target location")
-        break
-    time.sleep(1)
 
 vehicle.mode = VehicleMode("STABILIZE")
 
